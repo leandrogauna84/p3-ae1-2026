@@ -1,0 +1,12 @@
+name: Sync con upstream
+on:
+  schedule:
+    - cron: '0 */2 * * *'   # cada 2 horas (hora UTC)
+  workflow_dispatch:
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - run: gh repo sync ${{ github.repository }} -b main
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN }}
