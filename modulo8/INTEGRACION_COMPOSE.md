@@ -134,16 +134,33 @@ Desde ahí, los avisos de los viajes de ese usuario (conductor asignado, llegada
 inicio, finalización, cancelación) llegan como notificaciones del navegador.
 Un usuario sin navegador suscripto queda con la entrega `FAILED_NO_DEVICE_TOKEN`.
 
+M8 guarda junto a la suscripción el rol verificado por M1. Un conductor
+con suscripción activa recibe sus avisos por Web Push. Para los clientes con
+suscripción, M8 consulta la preferencia en M2. Los conductores que activaron
+el navegador antes de incorporar el rol deben volver a pulsar **Activar en
+este navegador** una vez. **Desactivar en este navegador** da de baja esa
+suscripción en M8 y en el navegador.
+
 ## Correo de recuperación de contraseña de M1
 
 M1 (RF-1.4) publica `auth.recuperacion_solicitada` en su exchange `m1.eventos`
 con el email, el nombre y el código. M8 lo recibe en la cola
 `m8.delivery.password-recovery` y envía el correo por SMTP. Con Gmail:
 
-1. En la cuenta de Google, activar la verificación en dos pasos y crear una
-   contraseña de aplicación.
-2. Completar `M8_SMTP_USER`, `M8_SMTP_PASSWORD` y `M8_MAIL_FROM` en
-   `.env.integracion` y recrear `m8-app`.
+1. En la cuenta de Google que se usará como remitente, activar la verificación en
+   dos pasos y crear una contraseña de aplicación para M8.
+2. Guardar el Gmail en `M8_SMTP_USER` y `M8_MAIL_FROM`. Guardar el código de
+   aplicación de 16 caracteres en `M8_SMTP_PASSWORD` de `.env.integracion`.
+3. Con el stack común iniciado, recrear `m8-app` desde la raíz del repositorio.
+
+   ```powershell
+   docker compose --env-file modulo8/.env.integracion up -d --no-deps --build --force-recreate m8-app
+   ```
+
+4. Desde la pantalla de recuperación de M1, solicitar un código para una cuenta
+   de prueba con un buzón accesible. Ingresar el código del correo y una
+   contraseña nueva en esa pantalla. Comprobar que la cuenta inicia sesión con
+   la nueva contraseña.
 
 Sin esa configuración los pedidos quedan esperando en la cola y se envían cuando
 se configura. El correo no se guarda en M8: solo queda la constancia de la entrega.
@@ -153,6 +170,9 @@ se configura. El correo no se guarda en M8: solo queda la constancia de la entre
 - `/tickets` (RF-8.5) exige un Bearer de M1 en el stack común y aplica permisos:
   cualquier usuario crea tickets; listar y cambiar estados es del `OPERADOR`;
   ver un ticket o su historial, del `OPERADOR` o de quien lo creó.
+- M1 firma los JWT con HS256 y un secreto compartido en `M1_JWT_SECRET`. En el
+  Compose común, la API de tokens de RF-8.7 exige el claim `exp` mediante
+  `M1_JWT_REQUIRE_EXP=true` y consulta a M1 si el usuario sigue habilitado.
 - RF-8.7 consulta preferencias a M2 con circuit breaker: si M2 no responde,
   tras 3 fallas deja de consultarlo 30 s y falla al instante, sin frenar al
   resto de la app (`UV_THREADPOOL_SIZE=16` en `m8-app`).
@@ -162,12 +182,23 @@ Para ver la cola y la DLQ: RabbitMQ → Queues → `m8.receipts.trip-completed*`
 
 ## Alcance de los demás requerimientos
 
+La [guía de cierre de integración AE4](docs/integracion-final-ae4.md) contiene
+los contratos para el frontend común, las penalizaciones y los pasos que
+requieren a otros equipos.
+
 La configuración usa nombres de servicio para M1, M2, M3, M6 y M7. El Compose
 de M8 integrado no agrega copias simuladas de esos módulos. Si alguno todavía no
 está levantado, las operaciones que lo consultan pueden responder
-indisponibilidad. Configurar `M8_M1_IDENTITY_URL`, `M8_M2_API_URL` y
-`M8_M7_PAYMENTS_URL` solo si cambian los nombres de servicio. Esto no impide
-probar QR, que depende de Redis y de la clave interna compartida.
+indisponibilidad. Configurar estas URLs solo si cambian los destinos del Compose
+común.
+
+- `M8_M1_IDENTITY_URL` es el endpoint completo que usan comprobantes y entrega.
+  Su valor por defecto es `http://m1-identidad-acceso:3001/auth/validar-identidad-y-rol`.
+- `M8_SUPPORT_M1_IDENTITY_URL` es la URL base de identidad que usa Soporte.
+  Su valor por defecto es `http://m1-identidad-acceso:3001`.
+- `M8_M2_API_URL` y `M8_M7_PAYMENTS_URL` apuntan a Clientes y Pagos.
+
+QR depende de Redis y de la clave interna compartida con M6.
 
 Las contraseñas de la base de M8 tienen valores locales por defecto, así que
 ningún otro módulo necesita configurar M8 para levantar el stack común.
