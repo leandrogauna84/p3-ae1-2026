@@ -86,8 +86,47 @@ const server = createServer(async (request, response) => {
     }
   }
 
+  if (provider === 'm3' && request.method === 'GET' && /^\/api\/conductor\/[^/]+\/estado$/.test(request.url)) {
+    const conductorId = decodeURIComponent(request.url.split('/')[3]);
+    return send(conductorId.startsWith('inexistente') ? 404 : 200, {
+      usuarioID: conductorId,
+      habilitado: conductorId !== 'suspendido',
+      disponible: conductorId !== 'suspendido',
+      estado: conductorId === 'suspendido' ? 'suspendido' : 'activo',
+      estado_conexion: conductorId === 'suspendido' ? 'desconectado' : 'conectado',
+    });
+  }
+
+  if (provider === 'm4' && request.method === 'POST' && request.url === '/api/v1/estimate') {
+    // Distancia en línea recta entre las coordenadas y ETA a 25 km/h, como el simulador anterior.
+    const origin = coordenadas(body.origin);
+    const destination = coordenadas(body.destination);
+    if (!origin || !destination) return send(400, { error: 'Coordenadas de origen y destino inválidas' });
+    const distanceKm = haversineKm(origin, destination);
+    return send(200, {
+      distanceKm: Math.round(distanceKm * 100) / 100,
+      estimatedEtaMinutes: Math.max(1, Math.ceil((distanceKm / 25) * 60)),
+    });
+  }
+
   return send(404, { error: 'Not found' });
 });
+
+function coordenadas(value) {
+  if (!value || typeof value !== 'object') return undefined;
+  const { latitude, longitude } = value;
+  const valida = (n, max) => typeof n === 'number' && Number.isFinite(n) && Math.abs(n) <= max;
+  return valida(latitude, 90) && valida(longitude, 180) ? { latitude, longitude } : undefined;
+}
+
+function haversineKm(origin, destination) {
+  const rad = (grados) => (grados * Math.PI) / 180;
+  const dLat = rad(destination.latitude - origin.latitude);
+  const dLon = rad(destination.longitude - origin.longitude);
+  const a = Math.sin(dLat / 2) ** 2
+    + Math.cos(rad(origin.latitude)) * Math.cos(rad(destination.latitude)) * Math.sin(dLon / 2) ** 2;
+  return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+}
 
 const port = Number(process.env.PORT ?? 3000);
 server.listen(port, '0.0.0.0');

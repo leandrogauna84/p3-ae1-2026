@@ -2,14 +2,15 @@
 #
 # Lo incluye el docker-compose.yml de la raíz. Usa la red `reservas-network`
 # y el RabbitMQ y Redis compartidos que define M9, y llama a los módulos reales
-# por su nombre de servicio. Para desarrollo y tests aislados con simuladores
+# por su nombre de servicio. Para desarrollo y tests aislados con APIs reales
 # se sigue usando modulo6/docker-compose.yml.
 #
 # Variables (en el .env de la raíz, nunca en Git):
 #   M7_API_KEY, QR_INTERNAL_API_KEY  secretos compartidos con M7 y M8
 #   M6_M7_URL, M6_M8_URL             URLs de M7 y M8 si cambian sus nombres de servicio
-#   M6_M3_URL                        M3 todavía no está en main: por defecto usa el simulador
+#   M6_M3_URL                        URL de M3 en la red integrada
 #   M6_*_HOST_PORT                   puertos del host (tabla acordada: 15000-15002)
+#   M6_VIAJES_REPLICAS               instancias de la API de viajes detrás del balanceador (1 por defecto)
 #   RABBITMQ_USER, RABBITMQ_PASSWORD los mismos que usa el RabbitMQ compartido
 
 x-m6-imagen: &m6-imagen
@@ -26,11 +27,38 @@ x-m6-healthcheck: &m6-healthcheck
   start_period: 10s
 
 services:
+  # Balanceador: se queda con el nombre m6-viajes y el puerto 15000, así M2, M5, M8 y el
+  # resto de M6 siguen usando http://m6-viajes:3000 sin cambios. Reparte entre las
+  # instancias de m6-viajes-app (ver modulo6/balanceador/default.conf.template).
   m6-viajes:
-    <<: *m6-imagen
-    command: ["node", "--import", "./dist/src/observabilidad/telemetria.js", "dist/src/rf-6.1-6.2-6.3/index.js"]
+    image: nginx:1.27-alpine
     ports:
       - "${M6_VIAJES_HOST_PORT:-15000}:3000"
+    environment:
+      M6_UPSTREAM: m6-viajes-app:3000
+    volumes:
+      - ./balanceador/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      m6-viajes-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    networks:
+      - reservas-network
+    restart: unless-stopped
+
+  # API de viajes (RF-6.1 a 6.4 y 6.7). Sin puerto en el host para poder escalarla:
+  #   docker compose up -d --scale m6-viajes-app=4
+  # o con M6_VIAJES_REPLICAS=4 en el .env de la raíz.
+  m6-viajes-app:
+    <<: *m6-imagen
+    command: ["node", "--import", "./dist/src/observabilidad/telemetria.js", "dist/src/rf-6.1-6.2-6.3/index.js"]
+    deploy:
+      replicas: ${M6_VIAJES_REPLICAS:-1}
     environment:
       NODE_ENV: production
       PORT: "3000"
@@ -47,7 +75,7 @@ services:
       M7_API_KEY: "${M7_API_KEY:-}"
       M8_URL: "${M6_M8_URL:-http://m8-app:3000}"
       M8_QR_API_KEY: "${QR_INTERNAL_API_KEY:-}"
-      M3_URL: "${M6_M3_URL:-http://m6-sim-m3:3001}"
+      M3_URL: "${M6_M3_URL:-http://m3-api:3000}"
       OTEL_SERVICE_NAME: m6-viajes
       OTEL_EXPORTER_OTLP_ENDPOINT: "${M6_OTEL_ENDPOINT:-}"
     depends_on:
@@ -115,17 +143,6 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
-    networks:
-      - reservas-network
-    restart: unless-stopped
-
-  # Sólo para M3 (estado del conductor), que todavía no está en main.
-  # Cuando M3 se sume al stack, definir M6_M3_URL con su servicio y quitar este contenedor.
-  m6-sim-m3:
-    <<: *m6-imagen
-    command: ["node", "dist/simulator/rf-6.4-6.7/m6-rf-6.4-rf6.7/server.js"]
-    expose:
-      - "3001"
     networks:
       - reservas-network
     restart: unless-stopped

@@ -3,6 +3,7 @@ import type { PoolClient } from 'pg';
 import type { Viaje } from '../models/viaje.model.js';
 import { EstadoViaje } from '../models/viaje.model.js';
 import {
+    eventosViajeCancelado,
     eventosViajeFinalizado,
     eventoTripEvents,
     traceparentActual,
@@ -52,8 +53,51 @@ export interface ViajeConHistorial extends Omit<Viaje, 'codigoVerificacion' | 'q
 
 let extensionSchemaPromise: Promise<void> | undefined;
 
+/**
+ * Versión del esquema que crea ESQUEMA_SQL. Subirla cada vez que se cambie ese SQL, para que
+ * las bases existentes lo vuelvan a aplicar una vez.
+ */
+const ESQUEMA_VERSION = 1;
+
 async function ensureExtensionSchema(): Promise<void> {
-    extensionSchemaPromise ??= pool.query(`
+    extensionSchemaPromise ??= aplicarEsquema().catch((error: unknown) => {
+        extensionSchemaPromise = undefined;
+        throw error;
+    });
+    await extensionSchemaPromise;
+}
+
+/**
+ * Aplica ESQUEMA_SQL una sola vez por versión, aunque m6-viajes tenga varias instancias.
+ *
+ * Aun con IF NOT EXISTS, sentencias como ALTER TABLE ... ADD COLUMN o CREATE OR REPLACE TRIGGER
+ * bloquean las tablas. Si una instancia las corre mientras otra atiende viajes, Postgres detecta
+ * un deadlock. Por eso:
+ * - un bloqueo de Postgres (advisory lock) hace que las instancias entren de a una, y
+ * - la tabla m6_esquema registra la versión aplicada: las demás instancias la ven y no tocan
+ *   las tablas.
+ */
+async function aplicarEsquema(): Promise<void> {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        await client.query(`SELECT pg_advisory_xact_lock(hashtext('m6-viajes:esquema'))`);
+        await client.query('CREATE TABLE IF NOT EXISTS m6_esquema (version INTEGER PRIMARY KEY)');
+        const aplicado = await client.query('SELECT 1 FROM m6_esquema WHERE version = $1', [ESQUEMA_VERSION]);
+        if (aplicado.rows.length === 0) {
+            await client.query(ESQUEMA_SQL);
+            await client.query('INSERT INTO m6_esquema (version) VALUES ($1)', [ESQUEMA_VERSION]);
+        }
+        await client.query('COMMIT');
+    } catch (error) {
+        await rollback(client);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+const ESQUEMA_SQL = `
         CREATE TABLE IF NOT EXISTS viaje_finalizaciones (
             viaje_id VARCHAR(50) PRIMARY KEY REFERENCES viajes(id) ON DELETE CASCADE,
             data JSONB NOT NULL,
@@ -114,12 +158,7 @@ async function ensureExtensionSchema(): Promise<void> {
             ON viaje_eventos_outbox(creado_at) WHERE publicado_at IS NULL;
         -- Contexto W3C de la solicitud que originó el evento, para continuar la traza al publicar.
         ALTER TABLE viaje_eventos_outbox ADD COLUMN IF NOT EXISTS traceparent TEXT;
-    `).then(() => undefined).catch((error: unknown) => {
-        extensionSchemaPromise = undefined;
-        throw error;
-    });
-    await extensionSchemaPromise;
-}
+`;
 
 /**
  * Guarda eventos en el outbox dentro de la transacción del cambio de estado.
@@ -407,7 +446,11 @@ export async function buscarViajesPorConductor(conductorId: string): Promise<Arr
     }));
 }
 
-export async function cancelarSiCancelable(id: string, actor?: string, motivo?: string): Promise<Viaje | null> {
+export async function cancelarSiCancelable(
+    id: string,
+    actor: 'cliente' | 'conductor' = 'cliente',
+    motivo = '',
+): Promise<Viaje | null> {
     await ensureExtensionSchema();
     const client = await pool.connect();
     try {
@@ -433,13 +476,27 @@ export async function cancelarSiCancelable(id: string, actor?: string, motivo?: 
         ].filter(Boolean).join(' ');
         await insertarTransicion(client, id, estadoAnterior, EstadoViaje.CANCELADO, detalle);
         const cancelado = mapRow(rows[0]);
-        // M4: si había conductor asignado, vuelve a quedar disponible.
-        await insertarEventosOutbox(client, id, [eventoTripEvents('viaje.cancelado', {
-            viajeId: id,
-            driverUserId: cancelado.driverUserId,
-            conductorId: cancelado.conductorId ?? null,
-            occurredAt: new Date(),
-        })]);
+        const canceladoAt = new Date();
+        await insertarEventosOutbox(client, id, [
+            // M4: si había conductor asignado, vuelve a quedar disponible.
+            eventoTripEvents('viaje.cancelado', {
+                viajeId: id,
+                driverUserId: cancelado.driverUserId,
+                conductorId: cancelado.conductorId ?? null,
+                occurredAt: canceladoAt,
+            }),
+            // M8: aviso de cancelación al cliente y, si lo había, al conductor.
+            ...eventosViajeCancelado({
+                viajeId: id,
+                clienteId: cancelado.clienteId,
+                conductorId: cancelado.conductorId ?? null,
+                clientUserId: cancelado.clientUserId,
+                driverUserId: cancelado.driverUserId,
+                canceladoAt,
+                cancelledBy: actor,
+                motivo,
+            }),
+        ]);
         await client.query('COMMIT');
         return cancelado;
     } catch (error) {

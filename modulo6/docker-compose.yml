@@ -1,12 +1,35 @@
 services:
+  # Balanceador: conserva el nombre `viajes` y el puerto 3000, así cancelacion, fachada,
+  # los tests y k6 no cambian. Reparte entre las instancias de viajes-app.
   viajes:
+    image: nginx:1.27-alpine
+    ports:
+      - "${M6_VIAJES_HOST_PORT:-3000}:3000"
+    environment:
+      M6_UPSTREAM: viajes-app:3000
+    volumes:
+      - ./balanceador/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+    depends_on:
+      viajes-app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  # API de viajes. Sin puerto en el host para poder escalarla:
+  #   docker compose up -d --scale viajes-app=4   (o M6_VIAJES_REPLICAS=4)
+  viajes-app:
     image: p3-ae1-2026-modulo6:local
     build:
       context: .
       dockerfile: Dockerfile
     command: ["node", "--import", "./dist/src/observabilidad/telemetria.js", "dist/src/rf-6.1-6.2-6.3/index.js"]
-    ports:
-      - "${M6_VIAJES_HOST_PORT:-3000}:3000"
+    deploy:
+      replicas: ${M6_VIAJES_REPLICAS:-1}
     environment:
       NODE_ENV: production
       PORT: 3000
@@ -15,9 +38,9 @@ services:
       OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-http://alloy:4318}
       M8_URL: ${M8_URL:-http://m8-app:3000}
       M8_QR_API_KEY: ${QR_INTERNAL_API_KEY:-}
-      M3_URL: http://simulador:3001
-      M4_URL: http://simulador:3001/api/v1
-      M7_URL: ${M7_URL:-http://host.docker.internal:16000}
+      M3_URL: ${M3_URL:-http://host.docker.internal:5000}
+      M4_URL: ${M4_URL:-http://host.docker.internal:3004/api/v1}
+      M7_URL: ${M7_URL:-http://host.docker.internal:17000}
       M7_API_KEY: ${M7_API_KEY:-}
       REDIS_URL: redis://redis:6379
       # Broker de eventos. Para la integración, apuntarlo al RabbitMQ compartido con M4/M5/M7/M8.
@@ -36,8 +59,6 @@ services:
         condition: service_healthy
       rabbitmq:
         condition: service_healthy
-      simulador:
-        condition: service_started
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then((r) => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
       interval: 10s
@@ -89,15 +110,6 @@ services:
       viajes:
         condition: service_healthy
     restart: unless-stopped
-
-  simulador:
-    image: p3-ae1-2026-modulo6:local
-    build:
-      context: .
-      dockerfile: Dockerfile
-    command: ["node", "dist/simulator/rf-6.4-6.7/m6-rf-6.4-rf6.7/server.js"]
-    expose:
-      - "3001"
 
   tripdb:
     image: p3-ae1-2026-modulo6-db:local

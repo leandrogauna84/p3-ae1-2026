@@ -134,10 +134,12 @@ describe('RF-6.4 - Finalización del viaje en Docker', () => {
     }
   });
 
-  it('keeps API alive while simulator is stopped', async () => {
+  // Antes apagaba el contenedor `simulador`; ahora M4 es el proveedor de prueba m4-e2e-test.
+  it('keeps API alive while M4 is stopped', async () => {
     const viajeId = await crearViaje({ clienteId: `E2E-64-outage-${Date.now()}`, iniciar: true });
+    const compose = ['compose', '-f', 'docker-compose.yml', '-f', 'docker-compose.rf-e2e.yml'];
 
-    execFileSync('docker', ['compose', 'stop', 'simulador']);
+    execFileSync('docker', [...compose, 'stop', 'm4-e2e-test']);
     try {
       const apiUrl = process.env.E2E_API_URL ?? 'http://127.0.0.1:3002';
       let health: Response | undefined;
@@ -155,7 +157,7 @@ describe('RF-6.4 - Finalización del viaje en Docker', () => {
       expect(response.status).toBe(503);
       expect(await health?.json()).toEqual({ status: 'ok' });
     } finally {
-      execFileSync('docker', ['compose', 'start', 'simulador']);
+      execFileSync('docker', [...compose, 'start', 'm4-e2e-test']);
     }
   });
 });

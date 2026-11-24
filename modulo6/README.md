@@ -33,7 +33,7 @@ Antes de levantar Compose:
 docker compose --env-file .env -f compose.yaml -f compose.integracion-real.yaml -f ../modulo6/docker-compose.m8-hostports.yml up -d --build --wait
 ```
 
-La URL interna configurada es `http://m8-app:3000`. M6 conserva sus puertos locales habituales; M8 queda publicado en `http://localhost:3103` para las comprobaciones desde el host. M3 y M4 continúan usando el simulador de M6.
+La URL interna configurada es `http://m8-app:3000`. M6 conserva sus puertos locales habituales; M8 queda publicado en `http://localhost:3103`. M3, M4, M7 y M8 se consumen mediante sus APIs reales configuradas; el Compose aislado puede apuntar a M3 mediante `M3_URL`.
 
 Para detener M8 desde `modulo8/` y luego M6 desde `modulo6/`:
 
@@ -75,14 +75,34 @@ El frontend de RF-6.1/6.2/6.3 se sirve desde la misma API M6, en `http://localho
 
 | Servicio | Puerto local | Responsabilidad |
 | --- | ---: | --- |
-| Viajes | 3000 | RF-6.1/6.2/6.3, persistencia y ciclo de vida |
+| Viajes (balanceador nginx) | 3000 | Reparte entre las instancias de la API de viajes |
+| Viajes (API, `viajes-app`) | — | RF-6.1/6.2/6.3, persistencia y ciclo de vida; escalable |
 | Cancelaciones | 3001 | RF-6.5/6.6, delega cambios a Viajes y publica eventos |
 | Fachada | 3002 | RF-6.4/6.7, finalización e historial; front de registro de viajes en `/` |
 | PostgreSQL | 5432 | Base compartida `tripdb` |
 | Redis | 6379 | Caché compartida |
 | RabbitMQ | 5672, gestión 15672 | Eventos de viajes y cancelaciones |
 
-Compose inicia un simulador interno únicamente para M3/M4. El QR se solicita y valida contra M8 real (`m8-app:3000`); las llamadas de tarifa y pago de M7 se dirigen a la API real mediante `M7_URL` y `M7_API_KEY`. Los tres servicios M6 comparten la misma imagen Node y la misma base; `npm run docker:down` detiene M6 y conserva el volumen de PostgreSQL.
+Compose utiliza únicamente servicios reales o proveedores E2E externos. El QR se solicita y valida contra M8 real (`m8-app:3000`); las llamadas de tarifa y pago de M7 se dirigen a la API real mediante `M7_URL` y `M7_API_KEY`. Los tres servicios M6 comparten la misma imagen Node y la misma base; `npm run docker:down` detiene M6 y conserva el volumen de PostgreSQL.
+
+## Escalar la API de viajes
+
+La API de viajes corre detrás de un balanceador nginx que conserva su nombre y su puerto: `viajes:3000` aquí y `m6-viajes:3000` (puerto 15000 en el host) en el stack común. Por eso los demás módulos, la fachada y el servicio de cancelación no cambian su URL. Las instancias (`viajes-app` / `m6-viajes-app`) no publican puerto, así que se pueden escalar:
+
+```sh
+docker compose up -d --scale viajes-app=4
+# o en el stack común, desde la raíz:
+docker compose up -d --scale m6-viajes-app=4
+```
+
+También se puede fijar con `M6_VIAJES_REPLICAS=4` en el `.env`. nginx vuelve a resolver el nombre cada 5 s, así que toma las instancias nuevas sin reiniciarse, y agrega la cabecera `X-M6-Instancia` con la instancia que atendió cada petición. Alloy descubre las instancias por DNS y mide cada una por separado.
+
+Para que varias instancias convivan:
+
+- El relay del outbox toma cada evento con `FOR UPDATE SKIP LOCKED`: cada evento lo publica una sola instancia.
+- El esquema se aplica una vez por versión (tabla `m6_esquema` y un advisory lock). Si se cambia el SQL del esquema en `viaje.repository.ts`, hay que subir `ESQUEMA_VERSION`.
+
+Comprobado con 4 instancias: 25 viajes cancelados en paralelo publicaron 75 eventos sin duplicados, sin deadlocks ni errores 5xx, y los E2E pasan (26/26).
 
 ## Front de RF-6.4 / RF-6.7
 
@@ -90,7 +110,7 @@ Con el stack levantado, abrir **http://localhost:3002/**. La fachada sirve una p
 
 - lista el registro de viajes (`GET /api/viajes`) filtrando por cliente, conductor y estado, con paginación; los filtros quedan en la URL para compartir la búsqueda;
 - muestra el detalle de un viaje: datos, resumen de la finalización y la línea de tiempo del historial de transiciones (solo inserción);
-- permite **finalizar** un viaje en curso (RF-6.4) con efectivo, transferencia o tarjeta (token de prueba; con el simulador, el token `rechazado` devuelve 402).
+- permite **finalizar** un viaje en curso (RF-6.4) con efectivo, transferencia o tarjeta (dependiendo del método configurado en M7).
 
 ## Observabilidad (logs, métricas y trazas)
 
@@ -195,10 +215,6 @@ modulo6/
 │   └── rf-6.5-6.6/
 ├── tests-e2e/
 │   ├── rf-6.1-6.2-6.3/
-│   ├── rf-6.4-6.7/
-│   └── rf-6.5-6.6/
-├── simulator/
-│   ├── rf-6.1-6.2-6.3/   # mock M8
 │   ├── rf-6.4-6.7/
 │   └── rf-6.5-6.6/
 ├── rf-6.1-6.2-6.3/   # SQL y documentación específica

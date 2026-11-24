@@ -37,6 +37,17 @@ export interface DatosViajeFinalizado {
     paymentId: string;
 }
 
+export interface DatosViajeCancelado {
+    viajeId: string;
+    clienteId: string;
+    conductorId: string | null;
+    clientUserId?: number | null;
+    driverUserId?: number | null;
+    canceladoAt: Date;
+    cancelledBy: 'cliente' | 'conductor';
+    motivo: string;
+}
+
 export const EXCHANGE_M8 = 'mobility.events';
 export const EXCHANGE_M3 = 'viajes.events';
 export const EXCHANGE_M4 = 'trip.events';
@@ -150,6 +161,44 @@ export function eventosViajeFinalizado(datos: DatosViajeFinalizado): EventoSalid
     return eventos;
 }
 
+/**
+ * TripCancelled para M8 (mobility.events, trip.cancelled), con el mismo sobre que TripCompleted.
+ * Un evento por destinatario: el cliente y, si había uno asignado, el conductor.
+ * Se omite el destinatario que no tiene userId numérico de M1.
+ */
+export function eventosViajeCancelado(datos: DatosViajeCancelado): EventoSalida[] {
+    const occurredAt = datos.canceladoAt.toISOString();
+    const destinatarios = [
+        idUsuarioM1(datos.clientUserId, datos.clienteId),
+        datos.conductorId ? idUsuarioM1(datos.driverUserId, datos.conductorId) : undefined,
+    ];
+
+    return destinatarios
+        .filter((recipientId): recipientId is number => recipientId !== undefined)
+        .map((recipientId) => {
+            const messageId = randomUUID();
+            return {
+                messageId,
+                exchange: EXCHANGE_M8,
+                routingKey: 'trip.cancelled',
+                payload: {
+                    messageId,
+                    eventType: 'TripCancelled',
+                    version: 1,
+                    occurredAt,
+                    correlationId: datos.viajeId,
+                    producer: PRODUCER,
+                    data: {
+                        tripId: datos.viajeId,
+                        recipientId,
+                        cancelledBy: datos.cancelledBy,
+                        motivo: datos.motivo,
+                    },
+                },
+            };
+        });
+}
+
 const RABBITMQ_URL = process.env.RABBITMQ_URL || 'amqp://localhost:5672';
 let conexion: ChannelModel | undefined;
 let canal: ConfirmChannel | undefined;
@@ -192,45 +241,15 @@ async function publicar(evento: EventoSalida): Promise<void> {
 
 /**
  * Publica los eventos pendientes del outbox y los marca como publicados.
- * Es seguro llamarla en paralelo: las ejecuciones se encadenan.
+ * Es seguro llamarla en paralelo: dentro de una instancia las ejecuciones se encadenan, y entre
+ * instancias (m6-viajes escalado detrás del balanceador) cada evento se toma con
+ * FOR UPDATE SKIP LOCKED, así que lo publica una sola instancia.
  */
 export function despacharEventosPendientes(limite = 50): Promise<number> {
     despachando ??= (async () => {
         let publicados = 0;
         try {
-            const { rows } = await pool.query(
-                `SELECT message_id, viaje_id, exchange, routing_key, payload, traceparent
-                 FROM viaje_eventos_outbox
-                 WHERE publicado_at IS NULL
-                 ORDER BY creado_at, message_id
-                 LIMIT $1`,
-                [limite],
-            );
-            for (const row of rows) {
-                // Continúa la traza de la solicitud que finalizó el viaje: la instrumentación de
-                // amqplib crea el span de publicación como hijo e inyecta el traceparent en el mensaje.
-                const contextoOrigen = row.traceparent
-                    ? propagation.extract(context.active(), { traceparent: row.traceparent })
-                    : context.active();
-                await context.with(contextoOrigen, () => conContexto(undefined, async () => {
-                    await publicar({
-                        messageId: row.message_id,
-                        exchange: row.exchange,
-                        routingKey: row.routing_key,
-                        payload: row.payload,
-                    });
-                    await pool.query(
-                        'UPDATE viaje_eventos_outbox SET publicado_at = now() WHERE message_id = $1',
-                        [row.message_id],
-                    );
-                    eventosPublicados.inc({ exchange: row.exchange, routing_key: row.routing_key });
-                    logger.info({
-                        tripId: row.viaje_id,
-                        messageId: row.message_id,
-                        exchange: row.exchange,
-                        routingKey: row.routing_key,
-                    }, 'Evento de viaje publicado');
-                }));
+            while (publicados < limite && await publicarSiguientePendiente()) {
                 publicados += 1;
             }
         } catch (error) {
@@ -245,6 +264,62 @@ export function despacharEventosPendientes(limite = 50): Promise<number> {
         return publicados;
     })();
     return despachando;
+}
+
+/**
+ * Toma el evento pendiente más antiguo que ninguna otra instancia tenga bloqueado, lo publica y lo
+ * marca como publicado, todo en una transacción. Devuelve false si no quedaba ninguno libre.
+ * Si la publicación falla, el ROLLBACK libera el evento y se reintenta en la próxima pasada.
+ */
+async function publicarSiguientePendiente(): Promise<boolean> {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        const { rows } = await client.query(
+            `SELECT message_id, viaje_id, exchange, routing_key, payload, traceparent
+             FROM viaje_eventos_outbox
+             WHERE publicado_at IS NULL
+             ORDER BY creado_at, message_id
+             LIMIT 1
+             FOR UPDATE SKIP LOCKED`,
+        );
+        const row = rows[0];
+        if (!row) {
+            await client.query('COMMIT');
+            return false;
+        }
+        // Continúa la traza de la solicitud que originó el evento: la instrumentación de
+        // amqplib crea el span de publicación como hijo e inyecta el traceparent en el mensaje.
+        const contextoOrigen = row.traceparent
+            ? propagation.extract(context.active(), { traceparent: row.traceparent })
+            : context.active();
+        await context.with(contextoOrigen, () => conContexto(undefined, async () => {
+            await publicar({
+                messageId: row.message_id,
+                exchange: row.exchange,
+                routingKey: row.routing_key,
+                payload: row.payload,
+            });
+            await client.query(
+                'UPDATE viaje_eventos_outbox SET publicado_at = now() WHERE message_id = $1',
+                [row.message_id],
+            );
+        }));
+        await client.query('COMMIT');
+        eventosPublicados.inc({ exchange: row.exchange, routing_key: row.routing_key });
+        logger.info({
+            tripId: row.viaje_id,
+            messageId: row.message_id,
+            exchange: row.exchange,
+            routingKey: row.routing_key,
+        }, 'Evento de viaje publicado');
+        return true;
+    } catch (error) {
+        await client.query('ROLLBACK').catch(() => undefined);
+        throw error;
+    } finally {
+        client.release();
+    }
 }
 
 export async function cerrarPublicador(): Promise<void> {
