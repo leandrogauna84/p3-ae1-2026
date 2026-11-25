@@ -2,6 +2,8 @@ import Database from "better-sqlite3";
 import fs from "fs";
 import path from "path";
 
+import { asegurarOperadorSemilla } from "./operador-semilla";
+
 const dataDirectory = path.join(
     process.cwd(),
     "data"
@@ -16,9 +18,13 @@ const databasePath = process.env.DATABASE_PATH || path.join(
     "identity.db"
 );
 
-const db = new Database(databasePath);
+const db = new Database(databasePath, { timeout: 5000 });
 
-db.pragma("journal_mode = WAL");
+try {
+    db.pragma("journal_mode = WAL");
+} catch {
+    // Otro proceso puede estar activando WAL al mismo tiempo
+}
 
 db.exec(`
     CREATE TABLE IF NOT EXISTS usuarios (
@@ -132,6 +138,9 @@ if (!existingOauthColumns.has("last_login_at")) {
         // Ignorar si ya fue agregada
     }
 }
+
+// RF-1.3: usuario OPERADOR semilla (ver operador-semilla.ts).
+asegurarOperadorSemilla(db);
 
 export default db;
 

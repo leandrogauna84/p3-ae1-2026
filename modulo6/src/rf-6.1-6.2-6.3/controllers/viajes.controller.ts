@@ -3,6 +3,7 @@ import type { Viaje } from '../models/viaje.model.js';
 import { EstadoViaje } from '../models/viaje.model.js';
 import { generarQR, M8ApiError, validarQR, type GenerarQRResponse } from '../services/qr.service.js';
 import * as viajeRepo from '../repositories/viaje.repository.js';
+import { autorizarQr } from '../services/qr-identity.service.js';
 import { randomUUID } from 'node:crypto';
 import { consultarEstadoConductor } from '../services/conductor.service.js';
 import { publicarEvento } from '../services/rabbitmq.service.js';
@@ -18,6 +19,7 @@ import { logger } from '../../observabilidad/logger.js';
 import { consultasHistorial, duracionFinalizacion, finalizaciones } from '../../observabilidad/metricas.js';
 
 class ErrorValidacionFinalizacion extends Error {}
+class ErrorDestinoPendiente extends Error {}
 
 function qrVigente(viaje: Viaje): boolean {
     return Boolean(
@@ -92,8 +94,10 @@ function viajeRespuestaLegacy(viaje: Viaje, completadoAt?: Date | null) {
     return {
         id: viaje.id,
         clienteId: viaje.clienteId,
+        clientUserId: viaje.clientUserId ?? null,
         conductorId: viaje.conductorId ?? null,
         estado: viaje.estado,
+        canceladoPor: viaje.canceladoPor ?? null,
         origen: viaje.origen,
         destino: viaje.destino,
         fechaCreacion: viaje.fechaCreacion,
@@ -167,8 +171,12 @@ export const obtenerViaje = async (req: Request, res: Response): Promise<any> =>
 
     let viaje: Viaje | null;
     let completadoAt: Date | null = null;
+    let iniciadoAt: Date | null = null;
     try {
         viaje = await viajeRepo.buscarPorId(id);
+        if (viaje?.estado === EstadoViaje.EN_CURSO || viaje?.estado === EstadoViaje.COMPLETADO) {
+            iniciadoAt = await viajeRepo.buscarInicioViaje(id);
+        }
         if (viaje?.estado === EstadoViaje.COMPLETADO) {
             completadoAt = await viajeRepo.buscarHoraFin(id);
         }
@@ -178,7 +186,7 @@ export const obtenerViaje = async (req: Request, res: Response): Promise<any> =>
     }
 
     if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
-    return res.json(viajeRespuestaLegacy(viaje, completadoAt));
+    return res.json({ ...viajeRespuestaLegacy(viaje, completadoAt), iniciadoAt, destinoConfirmadoAt: viaje.destinoConfirmadoAt ?? null });
 };
 
 export const cancelarViaje = async (req: Request, res: Response): Promise<any> => {
@@ -288,7 +296,6 @@ function validarDatosFinalizacion(input: unknown, inicio: Date): DatosFinalizaci
         tipoVehiculo: body.tipoVehiculo,
         horaFin,
         metodoPago: body.metodoPago,
-        ...(body.metodoPago === 'tarjeta' ? { pago: validarDatosPagoTarjeta(body.pago) } : {}),
     };
 }
 
@@ -312,6 +319,36 @@ function validarDatosPagoTarjeta(value: unknown): DatosPagoTarjeta {
     return { token: token.trim(), paymentMethodId: paymentMethodId.trim(), email: email.trim() };
 }
 
+export const confirmarDestino = async (req: Request, res: Response): Promise<any> => {
+    try {
+        const id = String(req.params.id);
+        const viaje = await viajeRepo.buscarPorId(id);
+        if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+        if (!process.env.M6_QR_IDENTITY_URL) return res.status(503).json({ error: 'Validación de participantes no disponible' });
+        if (!await autorizarQr(req, res, viaje, 'CONDUCTOR')) return;
+        const destinoConfirmadoAt = await viajeRepo.confirmarDestino(id, viaje.driverUserId!);
+        if (!destinoConfirmadoAt) return res.status(409).json({ error: 'El viaje debe estar en curso para confirmar la llegada.' });
+        return res.json({ destinoConfirmadoAt });
+    } catch {
+        return res.status(503).json({ error: 'No se pudo confirmar la llegada. Volvé a intentar.' });
+    }
+};
+
+export const consultarSeguimiento = async (req: Request, res: Response): Promise<any> => {
+    try {
+        const viaje = await viajeRepo.buscarPorId(String(req.params.id));
+        if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+        if (!process.env.M6_QR_IDENTITY_URL) return res.status(503).json({ error: 'Validación de participantes no disponible' });
+        if (!await autorizarQr(req, res, viaje, 'CLIENTE')) return;
+        if (viaje.estado !== EstadoViaje.EN_CURSO || viaje.destinoConfirmadoAt || !viaje.driverUserId) {
+            return res.status(404).json({ error: 'No hay seguimiento activo para este viaje.' });
+        }
+        return res.json({ driverUserId: viaje.driverUserId });
+    } catch {
+        return res.status(503).json({ error: 'No se pudo consultar el viaje.' });
+    }
+};
+
 export const finalizarViaje = async (req: Request, res: Response): Promise<any> => {
     const { id } = req.params;
     if (typeof id !== 'string') {
@@ -331,8 +368,33 @@ export const finalizarViaje = async (req: Request, res: Response): Promise<any> 
     };
 
     try {
+        const gestionarPago = req.body?.gestionarPago === true;
+        if (gestionarPago) {
+            const viaje = await viajeRepo.buscarPorId(id);
+            if (!viaje) {
+                registrar('no_encontrado');
+                return res.status(404).json({ error: 'Viaje no encontrado' });
+            }
+            if (!process.env.M6_QR_IDENTITY_URL) {
+                registrar('identidad_no_disponible');
+                return res.status(503).json({ error: 'Validación de participantes no disponible' });
+            }
+            if (!await autorizarQr(req, res, viaje, 'CLIENTE')) {
+                registrar('pago_no_autorizado');
+                return;
+            }
+        }
         const result = await viajeRepo.finalizarSiEnCurso(id, async (viaje, inicio) => {
-            const data = validarDatosFinalizacion(req.body, inicio);
+            if (process.env.M6_QR_IDENTITY_URL && !viaje.destinoConfirmadoAt) {
+                throw new ErrorDestinoPendiente('Esperá a que el conductor confirme la llegada al destino.');
+            }
+            const body = viaje.destinoConfirmadoAt ? { ...req.body, horaFin: viaje.destinoConfirmadoAt.toISOString() } : req.body;
+            const data = validarDatosFinalizacion(body, inicio);
+            if (gestionarPago) {
+                data.pagoAplicacion = data.metodoPago === 'tarjeta' && req.body.pago !== undefined
+                    ? { tarjeta: validarDatosPagoTarjeta(req.body.pago) }
+                    : {};
+            }
             return ejecutarServiciosFinalizacion(viaje, data, inicio);
         });
         if (result.kind === 'not-found') {
@@ -374,6 +436,10 @@ export const finalizarViaje = async (req: Request, res: Response): Promise<any> 
             idempotente: repetida,
         });
     } catch (error) {
+        if (error instanceof ErrorDestinoPendiente) {
+            registrar('destino_pendiente');
+            return res.status(409).json({ error: error.message });
+        }
         if (error instanceof ErrorServicioFinalizacion) {
             registrar(error.status === 402 ? 'pago_rechazado' : 'error_dependencia', { causa: error.message });
             return res.status(error.status).json({ error: error.message });
@@ -556,6 +622,7 @@ export const registrarArribo = async (req: Request, res: Response): Promise<any>
             error: 'Viaje no encontrado'
         });
     }
+    if (!await autorizarQr(req, res, viaje, 'CLIENTE')) return;
 
     let reintentoQR = viaje.estado === EstadoViaje.ARRIBADO;
     if (!reintentoQR && viaje.estado !== EstadoViaje.CONDUCTOR_EN_CAMINO) {
@@ -658,7 +725,7 @@ export const iniciarViaje = async (req: Request, res: Response): Promise<any> =>
     if (typeof id !== 'string') {
         return res.status(400).json({ error: 'Falta el id del viaje en la URL' });
     }
-    const codigoVerificacion = req.body.codigoVerificacion || req.body.token;
+    const codigoVerificacion = req.body?.codigoVerificacion || req.body?.token;
 
     let viaje;
     try {
@@ -671,6 +738,7 @@ export const iniciarViaje = async (req: Request, res: Response): Promise<any> =>
     }
 
     if (!viaje) return res.status(404).json({ error: 'Viaje no encontrado' });
+    if (!await autorizarQr(req, res, viaje, 'CONDUCTOR')) return;
     if (viaje.estado !== EstadoViaje.ARRIBADO) {
         return res.status(400).json({ error: `No puedes iniciar el viaje en este momento. Estado actual: ${viaje.estado}` });
     }

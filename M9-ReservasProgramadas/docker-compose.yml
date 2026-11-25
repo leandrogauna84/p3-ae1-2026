@@ -2,7 +2,7 @@ name: m9-reservas-programadas
 
 services:
   m9-reservas:
-    image: ${DOCKER_IMAGE:-ignacioparra1902/m9-reservas-programadas:v3.0}
+    image: ${DOCKER_IMAGE:-p3-ae1-2026-m9-reservas:local}
     build:
       context: .
       dockerfile: Dockerfile
@@ -22,11 +22,13 @@ services:
       # M5 real no consume los eventos m9.reservas.* (solo lo hacía m5-stub):
       # la activación debe invocar POST /api/v1/ride-requests por REST.
       DISPATCH_MODE: ${DISPATCH_MODE:-rest}
-      M9_DISPATCH_AUTH_URL: ${M9_DISPATCH_AUTH_URL:-}
+      M9_DISPATCH_AUTH_URL: ${M9_DISPATCH_AUTH_URL:-http://m1-identidad-acceso:3001/auth/token-delegado}
       M9_DISPATCH_AUTH_TOKEN: ${M9_DISPATCH_AUTH_TOKEN:-}
       ACTIVATION_RECOVERY_TIMEOUT_MS: ${ACTIVATION_RECOVERY_TIMEOUT_MS:-120000}
       M5_SERVICE_TOKEN: ${M5_SERVICE_TOKEN:-}
-      ROUTE_RESOLVER_MODE: ${ROUTE_RESOLVER_MODE:-blocked}
+      ROUTE_RESOLVER_MODE: ${ROUTE_RESOLVER_MODE:-m4}
+      M4_BASE_URL: ${M4_BASE_URL:-http://m4-api:3004}
+      M4_TIMEOUT_MS: ${M4_TIMEOUT_MS:-5000}
       ROUTE_STUB_ORIGIN_LATITUDE: ${ROUTE_STUB_ORIGIN_LATITUDE:--27.4514}
       ROUTE_STUB_ORIGIN_LONGITUDE: ${ROUTE_STUB_ORIGIN_LONGITUDE:--58.9867}
       ROUTE_STUB_DESTINATION_LATITUDE: ${ROUTE_STUB_DESTINATION_LATITUDE:--27.4692}

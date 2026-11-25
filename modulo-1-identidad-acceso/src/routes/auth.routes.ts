@@ -16,8 +16,11 @@ import {
     getUserInfo
 } from "../controllers/oauth2.controller";
 import { authenticateToken, authorizeRoles } from "../middleware/auth.middleware";
+import { authenticateInternalApiKey } from "../middleware/internal-api-key.middleware";
 import { loginRateLimit } from "../middleware/login-rate-limit.middleware";
-import { obtenerMiPerfil } from "../controllers/me.controller";
+import { obtenerMiPerfil, obtenerNombreUsuarioInterno } from "../controllers/me.controller";
+import { emitirTokenDelegadoHandler } from "../controllers/delegated-token.controller";
+import { autenticarCredencialDelegacion } from "../middleware/delegation-credential.middleware";
 
 const router = Router();
 
@@ -45,6 +48,13 @@ router.get(
     "/me",
     authenticateToken,
     obtenerMiPerfil
+);
+
+// Consulta interna entre servicios (ej. M8): nombre y apellido por userId con X-Internal-Api-Key
+router.get(
+    "/usuarios/:id/nombre",
+    authenticateInternalApiKey,
+    obtenerNombreUsuarioInterno
 );
 
 // ============ RF-1.4: Recuperación de Contraseña ============
@@ -89,6 +99,14 @@ router.get(
     "/oauth2/userinfo",
     authenticateToken,
     getUserInfo
+);
+
+// ============ Token delegado para M9 (reservas programadas) ============
+// M9 lo pide con su credencial de servicio cuando llega la hora de una reserva.
+router.post(
+    "/token-delegado",
+    autenticarCredencialDelegacion,
+    emitirTokenDelegadoHandler
 );
 
 // ============ Demostración RF-1.3 (Roles) ============
